@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# bopeep: little bo-peep has lost her sheep. One live page for every agent herdr is herding.
+set -uo pipefail
+version=0.1.0
+inside=
+[[ ${HERDR_ENV:-} == 1 && -n ${HERDR_PANE_ID:-} ]] && inside=1
+hints="⏎ send · empty ⏎ $([[ $inside ]] && echo jump || echo "attach (^b q back)") · ^k as keys · esc quit"
+
+usage() {
+  cat <<'EOF'
+Bopeep — one live dashboard for your Herdr agents.
+
+Usage: bopeep [--check | --help | --version]
+
+Choose an agent with Up/Down. Its terminal appears in the preview.
+Type a message and press Enter to send it to that agent.
+Press Enter with an empty message to jump to or attach to that agent.
+Type key names (for example: 1 enter), then Ctrl+K to send those keys.
+Press Esc or Ctrl+C to close Bopeep; agents keep running.
+
+Typing composes a message; it does not search the list.
+Requires Bash, Herdr, jq, and fzf 0.74.0 or newer.
+EOF
+}
+
+check_dependencies() {
+  local tool found=1 release
+  for tool in herdr fzf jq; do
+    command -v "$tool" >/dev/null || { printf 'bopeep: missing dependency: %s\n' "$tool" >&2; found=0; }
+  done
+  (( found )) || return 1
+  release=$(fzf --version) || return 1
+  if [[ ! $release =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] ||
+      (( BASH_REMATCH[1] == 0 && BASH_REMATCH[2] < 74 )); then
+    printf 'bopeep: fzf 0.74.0 or newer is required; found %s\n' "$release" >&2
+    return 1
+  fi
+}
+
+rows() {
+  local json rendered
+  json=$(herdr agent list 2>&1) || { printf '\t\033[31m✘ herdr unreachable: %s\033[0m\t\n' "${json//$'\n'/ }"; return; }
+  if ! rendered=$(jq -er --arg home "$HOME" --arg realhome "$(cd "$HOME" && pwd -P)" '
+    if (.result.agents | type) != "array" then error("expected result.agents array") else . end |
+    def rank: {blocked:0, done:1, working:2, unknown:3, idle:4}[.] // 5;
+    def glyph: {blocked:"●", done:"✔", working:"◐", unknown:"?", idle:"○"}[.] // "·";
+    def tint: {blocked:"1;31", done:"1;32", working:"33", unknown:"35", idle:"2"}[.] // "2";
+    def atint: {claude:"38;5;209", codex:"38;5;116", opencode:"38;5;111", gemini:"38;5;141"}[.] // "37";
+    def paint($c): "\u001b[\($c)m\(.)\u001b[0m";
+    def clean: gsub("[\u0000-\u001f\u007f-\u009f]"; " ");
+    def pad($n): .[0:$n] | . + (" " * ($n - length));
+    def proj: (if . == $home or . == $realhome then "~"
+               elif startswith($home + "/") then "~" + ltrimstr($home)
+               elif startswith($realhome + "/") then "~" + ltrimstr($realhome)
+               else . end) | ltrimstr("~/Projects/") | clean;
+    [.result.agents[] | .agent_status //= "unknown" | .proj = ((.foreground_cwd // .cwd // "?") | proj)]
+    | sort_by((.agent_status | rank), .proj) as $a
+    | ($a | group_by(.agent_status) | map({(.[0].agent_status): length}) | add // {}) as $n
+    | ("\t" + ("🐑 \($a | length) in the flock" | paint("1"))
+       + (if ($a | length) == 0 then "   Start an agent in Herdr to see it here." else
+          ([["blocked", "done", "working", "unknown", "idle"][] as $s | select($n[$s])
+           | "   " + ("\($s | glyph) \($n[$s]) \($s)" | paint($s | tint))] | join("")) end) + "\t"),
+      ($a[] | .agent_status as $s | .agent as $g
+       | [.pane_id,
+          " " + ("\($s | glyph) \($s)" | pad(9) | paint($s | tint)) + "  "
+            + ($g | clean | pad(9) | paint($g | atint)) + (.proj | pad(24) | paint("1"))
+            + ((.terminal_title_stripped // "") | clean | if . == "" then "—" else . end),
+          " \($g | clean) · \(.proj) "] | join("\t"))' <<<"$json" 2>/dev/null); then
+    printf '\t\033[31m✘ Could not read the agent list. Check your Herdr version.\033[0m\t\n'
+    return
+  fi
+  printf '%s\n' "$rendered"
+}
+
+# Called via fzf transform: prints the fzf actions to run next.
+say() { printf '%schange-footer:%s   ·   %s\n' "${2:+$2+}" "${1//$'\n'/ }" "$hints"; }
+
+enter() {
+  local out
+  [[ -n $1 ]] || { say "Select a running agent first"; return; }
+  if [[ -n $2 ]]; then
+    if out=$(herdr agent prompt "$1" "$2" 2>&1); then say "✔ sent to $1" clear-query
+    elif [[ $out == *agent_blocked* ]]; then say "🔒 $1 is waiting on a dialog: type the answer as keys, then ctrl-k"
+    else say "✘ $out"; fi
+  elif [[ $inside ]]; then
+    out=$(herdr agent focus "$1" 2>&1) && say "→ jumped to $1" || say "✘ $out"
+  else
+    echo 'execute(herdr agent attach {1})'
+  fi
+}
+
+keys() {
+  local k out
+  [[ -n $1 ]] || { say "Select a running agent first"; return; }
+  read -ra k <<<"$2"
+  (( ${#k[@]} )) || { say "type key names first, e.g. 1 · enter · esc · y"; return; }
+  out=$(herdr agent send-keys "$1" "${k[@]}" 2>&1) && say "✔ keys → $1: $2" clear-query || say "✘ $out"
+}
+
+# Every tick: re-read the flock, keep the cursor on the same pane, freeze while a reply is typed.
+# (fzf's own --track --id-nth drops keystrokes while it re-finds the item, so we pin via pos().)
+tick() {
+  [[ -n $2 ]] && { echo refresh-preview; return; }
+  rows >"$BOPEEP_ROWS.new" && mv "$BOPEEP_ROWS.new" "$BOPEEP_ROWS"
+  local n; n=$(tail -n +2 "$BOPEEP_ROWS" | cut -f1 | grep -m1 -nxF -- "$1" | cut -d: -f1)
+  printf 'reload-sync(cat "$BOPEEP_ROWS")+wait%s+refresh-preview\n' "${n:++pos($n)}"
+}
+
+ui() {
+  check_dependencies || return
+  export BOPEEP_ROWS BOPEEP_BIN
+  BOPEEP_BIN="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+  BOPEEP_ROWS=$(mktemp "${TMPDIR:-/tmp}/bopeep.XXXXXXXXXX") || return 1
+  trap 'rm -f "$BOPEEP_ROWS" "$BOPEEP_ROWS.new"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  local status=0
+  FZF_DEFAULT_OPTS= FZF_DEFAULT_OPTS_FILE= fzf --ansi --disabled --layout reverse --style full:rounded --no-info \
+    --delimiter '\t' --with-nth 2 --header-lines 1 \
+    --prompt 'reply ▸ ' --ghost 'type a reply for the highlighted agent' --pointer '▶' \
+    --list-label ' 🐑 bopeep ' --input-label ' reply ' --footer "$hints" \
+    --preview 'herdr agent read {1} --source recent-unwrapped --lines 200 --ansi' \
+    --preview-window 'right,50%,follow,wrap,<60(down,50%,follow,wrap)' \
+    --color 'border:#585b70,label:#a6e3a1,input-label:#fab387,prompt:#fab387,pointer:#f38ba8,bg+:#313244,fg+:-1:bold,footer:#7f849c,ghost:#6c7086' \
+    --bind 'start:reload-sync("$BOPEEP_BIN" _rows)' \
+    --bind 'every(2):bg-transform:"$BOPEEP_BIN" _tick {1} {q}' \
+    --bind 'focus:transform-preview-label:echo {3}' \
+    --bind 'enter:transform:"$BOPEEP_BIN" _enter {1} {q}' \
+    --bind 'ctrl-k:transform:"$BOPEEP_BIN" _keys {1} {q}' </dev/null || status=$?
+  [[ $status == 130 ]] && status=0
+  return "$status"
+}
+
+case ${1:-} in
+  --help|-h) usage ;;
+  --version|-V) printf 'bopeep %s\n' "$version" ;;
+  --check) check_dependencies && echo 'Bopeep dependencies are ready.' ;;
+  _rows) rows ;;
+  _enter) enter "${2:-}" "${3:-}" ;;
+  _keys) keys "${2:-}" "${3:-}" ;;
+  _tick) tick "${2:-}" "${3:-}" ;;
+  "") ui ;;
+  *) usage >&2; exit 2 ;;
+esac
